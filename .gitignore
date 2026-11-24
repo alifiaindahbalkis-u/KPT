@@ -1,0 +1,30 @@
+
+# Virtual Environment
+venv/
+.venv/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Environment Variables
+.env
+
+# Real Dataset Documents
+dataset/input/20newsgroups/*.txt
+
+# Dataset Cache
+dataset/cache/
+
+# Generated Documents
+dataset/generated/*.txt
+
+# Processing Results
+results/output/*
+results/reports/*
+results/graphs/*
+
+# Temporary Files
+*.log
+.DS_Store
+Thumbs.db
