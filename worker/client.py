@@ -2,6 +2,8 @@
 import socket
 import os
 import time
+import psutil
+
 from multiprocessing import Pool
 
 from common.config import MASTER_PORT, WORKER_MAX_PROCESSES
@@ -11,14 +13,30 @@ from worker.main import process_document
 
 MASTER_ADDRESS = os.getenv("MASTER_ADDRESS", "127.0.0.1")
 WORKER_ID = f"WORKER-{socket.gethostname()}"
-BATCH_SIZE = 2
 
 
 def process_task(task):
+    """
+    Memproses satu dokumen menggunakan fungsi
+    dari worker.main.
+    """
+
     return process_document(
         task,
         search_term=task.get("search_term")
     )
+
+
+def get_worker_metrics():
+    """
+    Mengambil informasi kondisi komputer Worker.
+    """
+
+    return {
+        "process_count": WORKER_MAX_PROCESSES,
+        "cpu_percent": psutil.cpu_percent(interval=None),
+        "memory_percent": psutil.virtual_memory().percent,
+    }
 
 
 def start_worker():
@@ -28,17 +46,29 @@ def start_worker():
         socket.SOCK_STREAM
     )
 
+    total_processed = 0
+
+    # Informasi performa batch sebelumnya.
+    last_batch_duration = 0
+    last_batch_count = 0
+
     try:
 
-        print("=" * 40)
+        print("=" * 45)
         print(f"WORKER: {WORKER_ID}")
-        print("=" * 40)
+        print("=" * 45)
 
         print("Menghubungkan Worker ke Master...")
+        print(f"Alamat Master: {MASTER_ADDRESS}")
+        print(f"Port Master: {MASTER_PORT}")
 
         connection.connect(
             (MASTER_ADDRESS, MASTER_PORT)
         )
+
+        # ----------------------------------
+        # REGISTRASI WORKER
+        # ----------------------------------
 
         send_message(connection, {
             "type": "register",
@@ -47,68 +77,117 @@ def start_worker():
 
         response = receive_message(connection)
 
-        if not response or response.get("status") != "success":
+        if (
+            not response
+            or response.get("type") != "registered"
+            or response.get("status") != "success"
+        ):
+
             print("Registrasi Worker gagal.")
             return
 
-        print("Worker berhasil terhubung!")
+        print("\nWorker berhasil terhubung!")
         print(f"Worker ID: {WORKER_ID}")
         print(f"Jumlah proses: {WORKER_MAX_PROCESSES}")
 
-        total_processed = 0
+        # ----------------------------------
+        # MULTIPROCESSING
+        # ----------------------------------
 
         with Pool(processes=WORKER_MAX_PROCESSES) as pool:
 
             while True:
 
+                # Mengambil kondisi komputer terkini.
+                metrics = get_worker_metrics()
+
+                # ----------------------------------
+                # MEMINTA TUGAS KE MASTER
+                # ----------------------------------
+
                 send_message(connection, {
                     "type": "request_batch",
                     "worker_id": WORKER_ID,
-                    "batch_size": BATCH_SIZE
+
+                    "process_count": metrics["process_count"],
+                    "cpu_percent": metrics["cpu_percent"],
+                    "memory_percent": metrics["memory_percent"],
+
+                    "last_batch_duration": last_batch_duration,
+                    "last_batch_count": last_batch_count,
                 })
 
                 response = receive_message(connection)
 
                 if response is None:
-                    print("Koneksi ke Master terputus.")
+
+                    print("\nKoneksi ke Master terputus.")
                     break
 
                 message_type = response.get("type")
 
-                # Menunggu Worker lainnya
+                # ----------------------------------
+                # MENUNGGU WORKER LAIN
+                # ----------------------------------
+
                 if message_type == "wait":
 
                     print(
-                        "[WAIT] Menunggu Worker lainnya..."
+                        "\n[WAIT] Menunggu tugas tersedia..."
                     )
 
                     time.sleep(1)
                     continue
 
-                # Tidak ada tugas tersisa
+                # ----------------------------------
+                # TIDAK ADA TUGAS TERSISA
+                # ----------------------------------
+
                 elif message_type == "no_task":
 
                     print("\nTidak ada tugas tersisa.")
                     print("Worker selesai bekerja.")
                     break
 
-                # Menerima batch tugas
+                # ----------------------------------
+                # MENERIMA BATCH TUGAS
+                # ----------------------------------
+
                 elif message_type == "task_batch":
 
                     tasks = response.get("tasks", [])
 
                     if not tasks:
-                        break
+                        continue
 
                     print(
                         f"\n[BATCH] {WORKER_ID} menerima "
-                        f"{len(tasks)} dokumen"
+                        f"{len(tasks)} tugas"
                     )
+
+                    print(
+                        f"[RESOURCE] CPU: "
+                        f"{metrics['cpu_percent']}% | "
+                        f"RAM: {metrics['memory_percent']}%"
+                    )
+
+                    # Mengukur waktu pemrosesan.
+                    start_time = time.perf_counter()
 
                     batch_results = pool.map(
                         process_task,
                         tasks
                     )
+
+                    last_batch_duration = (
+                        time.perf_counter() - start_time
+                    )
+
+                    last_batch_count = len(batch_results)
+
+                    # ----------------------------------
+                    # MENAMPILKAN HASIL
+                    # ----------------------------------
 
                     for result in batch_results:
 
@@ -117,6 +196,10 @@ def start_worker():
                             f"{result['document_id']} "
                             f"- {result['status']}"
                         )
+
+                    # ----------------------------------
+                    # MENGIRIM HASIL KE MASTER
+                    # ----------------------------------
 
                     send_message(connection, {
                         "type": "result_batch",
@@ -131,14 +214,25 @@ def start_worker():
                         or acknowledgment.get("type") != "ack_batch"
                     ):
 
-                        print("Konfirmasi hasil tidak diterima.")
+                        print(
+                            "Konfirmasi hasil tidak diterima."
+                        )
+
                         break
 
                     total_processed += len(batch_results)
 
                     print(
-                        f"[SUCCESS] {len(batch_results)} hasil "
-                        f"diterima Master."
+                        f"\n[SUCCESS] {len(batch_results)} hasil "
+                        f"dikonfirmasi Master."
+                    )
+
+                    print(
+                        f"[PERFORMANCE] "
+                        f"Durasi: {last_batch_duration:.4f} detik | "
+                        f"Throughput: "
+                        f"{last_batch_count / last_batch_duration:.2f} "
+                        f"tugas/detik"
                     )
 
                     print(
@@ -148,7 +242,11 @@ def start_worker():
 
                 else:
 
-                    print("Respons tidak dikenal:", response)
+                    print(
+                        "Respons tidak dikenal:",
+                        response
+                    )
+
                     break
 
         print("\n===================================")
@@ -157,15 +255,22 @@ def start_worker():
         print(f"Total dokumen: {total_processed}")
 
     except ConnectionRefusedError:
-        print("Koneksi ditolak. Pastikan Master aktif.")
+
+        print(
+            "\nKoneksi ditolak. Pastikan Master aktif "
+            "dan alamat IP sudah benar."
+        )
 
     except KeyboardInterrupt:
-        print("\nWorker dihentikan.")
+
+        print("\nWorker dihentikan oleh pengguna.")
 
     except (ConnectionError, OSError) as error:
-        print("Terjadi kesalahan:", error)
+
+        print("\nTerjadi kesalahan:", error)
 
     finally:
+
         connection.close()
         print("Koneksi Worker ditutup.")
 
