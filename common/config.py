@@ -11,6 +11,7 @@ MASTER_PORT = 5000
 
 # Jumlah minimal Worker aktif
 MIN_WORKERS = int(os.getenv("MIN_WORKERS", "2"))
+WORKER_COUNT_OPTIONS = (1, 2, 4, 6, 9)
 
 # Konfigurasi Worker
 WORKER_MAX_PROCESSES = int(

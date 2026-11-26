@@ -1,5 +1,6 @@
 import argparse
-import os
+
+from common.config import WORKER_COUNT_OPTIONS
 
 
 def main():
@@ -7,21 +8,18 @@ def main():
         description="Jalankan server master pemrosesan dokumen."
     )
     parser.add_argument(
+        "--workers",
         "--min-workers",
+        dest="worker_target",
         type=int,
-        default=int(os.environ.get("MIN_WORKERS", "2")),
-        help="Jumlah worker minimum sebelum tugas dibagikan (default: 2).",
+        choices=WORKER_COUNT_OPTIONS,
+        help="Pilih target worker tanpa prompt interaktif.",
     )
     args = parser.parse_args()
 
-    if args.min_workers < 1:
-        parser.error("--min-workers harus minimal 1.")
-
-    os.environ["MIN_WORKERS"] = str(args.min_workers)
-
     from master.main import start_master
 
-    start_master()
+    start_master(worker_target=args.worker_target)
 
 
 if __name__ == "__main__":

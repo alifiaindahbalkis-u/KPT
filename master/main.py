@@ -13,6 +13,10 @@ from common.config import (
     DEFAULT_BATCH_SIZE,
     MAX_CPU_THRESHOLD,
     MAX_TASK_RETRIES,
+    DATASET_DIR,
+    METADATA_FILE,
+    DEFAULT_SEARCH_TERM,
+    WORKER_COUNT_OPTIONS,
 )
 
 from common.protocol import send_message, receive_message
@@ -38,6 +42,8 @@ in_flight = {}
 task_retries = {}
 
 completion_announced = False
+processing_started = False
+target_reached_announced = False
 
 
 # ==========================================
@@ -248,9 +254,9 @@ def requeue_worker_tasks(worker_id):
 # ==========================================
 
 def master_console():
-    print(
-        "Perintah master: list | approve <worker_id> | approve all"
-    )
+    global processing_started
+
+    print("Perintah master: list | start")
 
     while True:
         try:
@@ -265,48 +271,97 @@ def master_console():
 
         if action == "list" and len(command) == 1:
             with workers_lock:
-                workers = [
-                    (
-                        worker_id,
-                        worker["address"],
-                        worker["approved"],
-                    )
-                    for worker_id, worker in connected_workers.items()
-                ]
+                workers = list(connected_workers.items())
+                start_requested = processing_started
 
             if not workers:
-                print("Belum ada Worker yang terhubung.")
+                print(f"Worker terhubung: 0/{MIN_WORKERS}")
                 continue
 
-            for worker_id, address, approved in workers:
-                status = "DISETUJUI" if approved else "MENUNGGU PERSETUJUAN"
-                print(f"{worker_id} ({address}) - {status}")
+            print(f"Worker terhubung: {len(workers)}/{MIN_WORKERS}")
+            for worker_id, worker in workers:
+                address = worker["address"]
+                print(
+                    f"{worker_id} - {address[0]}:{address[1]}"
+                )
 
-        elif action == "approve" and len(command) == 2:
-            target = command[1]
+            if len(workers) >= MIN_WORKERS and not start_requested:
+                print("Target terpenuhi. Ketik 'start' untuk menjalankan tugas.")
 
+        elif action == "start" and len(command) == 1:
             with workers_lock:
-                if target.lower() == "all":
-                    approved_workers = list(connected_workers)
-                    for worker in connected_workers.values():
-                        worker["approved"] = True
-                else:
-                    worker = connected_workers.get(target)
-                    approved_workers = [target] if worker else []
-                    if worker:
-                        worker["approved"] = True
+                worker_count = len(connected_workers)
 
-            if approved_workers:
-                for worker_id in approved_workers:
-                    print(f"Worker {worker_id} disetujui.")
-            else:
-                print(f"Worker '{target}' tidak ditemukan.")
+                if processing_started:
+                    message = "Pemrosesan sudah dimulai."
+                elif worker_count < MIN_WORKERS:
+                    message = (
+                        f"Target Worker belum terpenuhi "
+                        f"({worker_count}/{MIN_WORKERS})."
+                    )
+                else:
+                    processing_started = True
+                    message = "Pemrosesan dimulai atas perintah Master."
+
+            print(message)
 
         else:
-            print(
-                "Perintah tidak dikenal. Gunakan: "
-                "list | approve <worker_id> | approve all"
-            )
+            print("Perintah tidak dikenal. Gunakan: list | start")
+
+
+def get_master_ipv4_addresses():
+    addresses = set()
+
+    try:
+        interfaces = socket.getaddrinfo(
+            socket.gethostname(),
+            None,
+            socket.AF_INET,
+        )
+    except socket.gaierror as error:
+        print(f"Tidak dapat mendeteksi IP Master: {error}")
+    else:
+        addresses.update(
+            address[4][0]
+            for address in interfaces
+            if not address[4][0].startswith(("127.", "169.254."))
+        )
+
+    routed_address = None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route_socket:
+            route_socket.connect(("8.8.8.8", 80))
+            routed_address = route_socket.getsockname()[0]
+    except OSError as error:
+        if not addresses:
+            print(f"Tidak dapat menentukan IP jaringan aktif: {error}")
+
+    if routed_address and not routed_address.startswith(("127.", "169.254.")):
+        addresses.add(routed_address)
+
+    if routed_address in addresses:
+        return [routed_address] + sorted(addresses - {routed_address})
+
+    return sorted(addresses)
+
+
+def choose_worker_target():
+    choices = ", ".join(str(count) for count in WORKER_COUNT_OPTIONS)
+    print(f"Pilihan target jumlah Worker: {choices}")
+
+    while True:
+        choice = input("Pilih jumlah Worker: ").strip()
+
+        try:
+            worker_target = int(choice)
+        except ValueError:
+            print(f"Masukkan salah satu pilihan: {choices}.")
+            continue
+
+        if worker_target in WORKER_COUNT_OPTIONS:
+            return worker_target
+
+        print(f"Masukkan salah satu pilihan: {choices}.")
 
 
 # ==========================================
@@ -317,6 +372,7 @@ def handle_worker(connection, address):
 
     global completed_count
     global completion_announced
+    global target_reached_announced
 
     worker_id = None
 
@@ -346,17 +402,23 @@ def handle_worker(connection, address):
                 "memory_percent": None,
                 "throughput": 0,
                 "assigned_tasks": set(),
-                "approved": False,
             }
 
             worker_count = len(connected_workers)
+            target_reached_now = (
+                worker_count >= MIN_WORKERS
+                and not target_reached_announced
+            )
+            if target_reached_now:
+                target_reached_announced = True
 
         print(f"Worker terdaftar: {worker_id}")
-        print(f"Worker aktif: {worker_count}/{MIN_WORKERS}")
-        print(
-            f"[APPROVAL PENDING] Gunakan 'approve {worker_id}' "
-            "di konsol master untuk mengizinkan tugas."
-        )
+        print(f"Worker terhubung: {worker_count}/{MIN_WORKERS}")
+        if target_reached_now:
+            print(
+                "[READY] Target Worker terpenuhi. "
+                "Ketik 'start' di konsol Master untuk menjalankan tugas."
+            )
 
         send_message(connection, {
             "type": "registered",
@@ -382,24 +444,21 @@ def handle_worker(connection, address):
 
                 with workers_lock:
                     worker_count = len(connected_workers)
+                    start_requested = processing_started
 
                 if worker_count < MIN_WORKERS:
 
                     send_message(connection, {
-                        "type": "wait",
+                        "type": "wait_workers",
                         "message": "Menunggu Worker lainnya",
                     })
 
                     continue
 
-                with workers_lock:
-                    worker = connected_workers.get(worker_id)
-                    approved = bool(worker and worker["approved"])
-
-                if not approved:
+                if not start_requested:
                     send_message(connection, {
-                        "type": "wait_approval",
-                        "message": "Menunggu persetujuan Master",
+                        "type": "wait_start",
+                        "message": "Menunggu perintah start dari Master",
                     })
                     continue
 
@@ -590,6 +649,9 @@ def handle_worker(connection, address):
 
             with workers_lock:
                 connected_workers.pop(worker_id, None)
+                worker_count = len(connected_workers)
+                if worker_count < MIN_WORKERS and not processing_started:
+                    target_reached_announced = False
 
             if returned:
                 print(
@@ -598,6 +660,7 @@ def handle_worker(connection, address):
                 )
 
             print(f"Worker {worker_id} terputus.")
+            print(f"Worker terhubung: {worker_count}/{MIN_WORKERS}")
 
         connection.close()
 
@@ -606,45 +669,74 @@ def handle_worker(connection, address):
 # START MASTER
 # ==========================================
 
-def start_master():
+def start_master(worker_target=None):
 
+    global MIN_WORKERS
     global task_queue
     global total_tasks
     global completed_count
     global completion_announced
-
-    task_queue, total_tasks = create_task_queue(limit=1000)
+    global processing_started
+    global target_reached_announced
 
     completed_count = 0
     completion_announced = False
+    processing_started = False
+    target_reached_announced = False
 
     results.clear()
     completed_task_ids.clear()
     in_flight.clear()
     task_retries.clear()
-    connected_workers.clear()
-
-    server = socket.socket(
-        socket.AF_INET,
-        socket.SOCK_STREAM,
-    )
-
-    server.setsockopt(
-        socket.SOL_SOCKET,
-        socket.SO_REUSEADDR,
-        1,
-    )
-
-    server.bind((MASTER_HOST, MASTER_PORT))
-    server.listen(10)
+    with workers_lock:
+        connected_workers.clear()
 
     print("\n" + "=" * 45)
     print(" DISTRIBUTED FILE PROCESSING - MASTER")
     print("=" * 45)
 
+    print(f"Alamat listen: {MASTER_HOST}:{MASTER_PORT}")
+    master_addresses = get_master_ipv4_addresses()
+    if master_addresses:
+        print(f"IP Master utama untuk Worker: {master_addresses[0]}")
+        if len(master_addresses) > 1:
+            print("IP lokal lain:")
+            for address in master_addresses[1:]:
+                print(f"  {address}")
+    else:
+        print("IP Master tidak terdeteksi; Worker lokal dapat memakai 127.0.0.1.")
+
+    print(f"Dataset yang diproses: {DATASET_DIR}")
+    print(f"Metadata: {METADATA_FILE}")
+    print(
+        "Proses: analisis kata, frekuensi 10 kata teratas, "
+        f"dan pencarian '{DEFAULT_SEARCH_TERM}'."
+    )
+
+    task_queue, total_tasks = create_task_queue(limit=1000)
+
+    if worker_target is None:
+        worker_target = choose_worker_target()
+    elif worker_target not in WORKER_COUNT_OPTIONS:
+        choices = ", ".join(str(count) for count in WORKER_COUNT_OPTIONS)
+        raise ValueError(
+            f"Target Worker harus salah satu dari: {choices}."
+        )
+
+    MIN_WORKERS = worker_target
+    print(f"\nTarget Worker dipilih: {MIN_WORKERS}")
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((MASTER_HOST, MASTER_PORT))
+    server.listen(10)
+
     print(f"Master berjalan pada port {MASTER_PORT}")
-    print(f"Total tugas: {total_tasks}")
-    print(f"Menunggu minimal {MIN_WORKERS} Worker...\n")
+    print(
+        f"Menunggu {MIN_WORKERS} Worker atau lebih. "
+        "Tugas tidak berjalan otomatis."
+    )
+
     threading.Thread(
         target=master_console,
         daemon=True,
