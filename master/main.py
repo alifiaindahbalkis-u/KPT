@@ -42,8 +42,7 @@ in_flight = {}
 task_retries = {}
 
 completion_announced = False
-processing_started = False
-target_reached_announced = False
+job_state = "waiting_workers"
 
 
 # ==========================================
@@ -254,9 +253,9 @@ def requeue_worker_tasks(worker_id):
 # ==========================================
 
 def master_console():
-    global processing_started
+    global job_state
 
-    print("Perintah master: list | start")
+    print("Perintah master: list | start | new | close")
 
     while True:
         try:
@@ -272,11 +271,7 @@ def master_console():
         if action == "list" and len(command) == 1:
             with workers_lock:
                 workers = list(connected_workers.items())
-                start_requested = processing_started
-
-            if not workers:
-                print(f"Worker terhubung: 0/{MIN_WORKERS}")
-                continue
+                current_state = job_state
 
             print(f"Worker terhubung: {len(workers)}/{MIN_WORKERS}")
             for worker_id, worker in workers:
@@ -285,28 +280,95 @@ def master_console():
                     f"{worker_id} - {address[0]}:{address[1]}"
                 )
 
-            if len(workers) >= MIN_WORKERS and not start_requested:
+            print(f"Status job: {current_state}")
+            if (
+                len(workers) >= MIN_WORKERS
+                and current_state == "ready"
+            ):
                 print("Target terpenuhi. Ketik 'start' untuk menjalankan tugas.")
 
         elif action == "start" and len(command) == 1:
             with workers_lock:
                 worker_count = len(connected_workers)
 
-                if processing_started:
+                if job_state == "running":
                     message = "Pemrosesan sudah dimulai."
+                elif job_state == "completed":
+                    message = "Job selesai. Pilih 'new' atau 'close'."
+                elif job_state == "shutting_down":
+                    message = "Master sedang ditutup."
                 elif worker_count < MIN_WORKERS:
                     message = (
                         f"Target Worker belum terpenuhi "
                         f"({worker_count}/{MIN_WORKERS})."
                     )
                 else:
-                    processing_started = True
+                    job_state = "running"
                     message = "Pemrosesan dimulai atas perintah Master."
 
             print(message)
 
+        elif action == "new" and len(command) == 1:
+            with workers_lock:
+                can_start_new_job = job_state == "completed"
+
+            if not can_start_new_job:
+                print("Pilih 'new' hanya setelah job selesai.")
+                continue
+
+            start_new_job()
+
+        elif action == "close" and len(command) == 1:
+            with workers_lock:
+                if job_state == "completed":
+                    job_state = "shutting_down"
+                    message = "Master ditutup; Worker akan diberi tahu."
+                else:
+                    message = "Pilih 'close' setelah job selesai."
+
+            print(message)
+
         else:
-            print("Perintah tidak dikenal. Gunakan: list | start")
+            print(
+                "Perintah tidak dikenal. Gunakan: "
+                "list | start | new | close"
+            )
+
+
+def start_new_job():
+    global task_queue
+    global total_tasks
+    global completed_count
+    global completion_announced
+    global job_state
+
+    next_task_queue, next_total_tasks = create_task_queue(limit=1000)
+
+    with task_lock:
+        task_queue = next_task_queue
+        total_tasks = next_total_tasks
+        completed_count = 0
+        results.clear()
+        completed_task_ids.clear()
+        in_flight.clear()
+        task_retries.clear()
+        completion_announced = False
+
+    with workers_lock:
+        worker_count = len(connected_workers)
+        if worker_count >= MIN_WORKERS:
+            job_state = "ready"
+        else:
+            job_state = "waiting_workers"
+
+    print("Dataset yang sama siap diproses kembali.")
+    if worker_count >= MIN_WORKERS:
+        print("Ketik 'start' jika sudah siap menjalankan job baru.")
+    else:
+        print(
+            f"Menunggu Worker: {worker_count}/{MIN_WORKERS} "
+            "sebelum job baru dapat dimulai."
+        )
 
 
 def get_master_ipv4_addresses():
@@ -372,7 +434,7 @@ def handle_worker(connection, address):
 
     global completed_count
     global completion_announced
-    global target_reached_announced
+    global job_state
 
     worker_id = None
 
@@ -407,10 +469,10 @@ def handle_worker(connection, address):
             worker_count = len(connected_workers)
             target_reached_now = (
                 worker_count >= MIN_WORKERS
-                and not target_reached_announced
+                and job_state == "waiting_workers"
             )
             if target_reached_now:
-                target_reached_announced = True
+                job_state = "ready"
 
         print(f"Worker terdaftar: {worker_id}")
         print(f"Worker terhubung: {worker_count}/{MIN_WORKERS}")
@@ -444,9 +506,24 @@ def handle_worker(connection, address):
 
                 with workers_lock:
                     worker_count = len(connected_workers)
-                    start_requested = processing_started
+                    current_state = job_state
 
-                if worker_count < MIN_WORKERS:
+                if current_state == "shutting_down":
+                    send_message(connection, {
+                        "type": "shutdown",
+                    })
+                    break
+
+                if current_state == "completed":
+                    send_message(connection, {
+                        "type": "job_complete",
+                    })
+                    continue
+
+                if (
+                    worker_count < MIN_WORKERS
+                    or current_state == "waiting_workers"
+                ):
 
                     send_message(connection, {
                         "type": "wait_workers",
@@ -455,7 +532,7 @@ def handle_worker(connection, address):
 
                     continue
 
-                if not start_requested:
+                if current_state != "running":
                     send_message(connection, {
                         "type": "wait_start",
                         "message": "Menunggu perintah start dari Master",
@@ -500,12 +577,31 @@ def handle_worker(connection, address):
                         all_completed = (
                             completed_count >= total_tasks
                         )
+                        announce_completion = (
+                            all_completed and not completion_announced
+                        )
+                        if announce_completion:
+                            completion_announced = True
 
                     if all_completed:
 
+                        with workers_lock:
+                            if job_state == "running":
+                                job_state = "completed"
+
                         send_message(connection, {
-                            "type": "no_task",
+                            "type": "job_complete",
                         })
+
+                        if announce_completion:
+                            print("\n===================================")
+                            print("SELURUH TUGAS BERHASIL DIPROSES")
+                            print("===================================")
+                            print(f"Total hasil: {len(results)}")
+                            print(
+                                "Ketik 'new' untuk mengulang dataset "
+                                "atau 'close' untuk menutup program."
+                            )
 
                     elif pending_count > 0:
 
@@ -580,6 +676,15 @@ def handle_worker(connection, address):
                     all_completed = (
                         completed_count >= total_tasks
                     )
+                    announce_completion = (
+                        all_completed and not completion_announced
+                    )
+                    if announce_completion:
+                        completion_announced = True
+
+                if all_completed:
+                    with workers_lock:
+                        job_state = "completed"
 
                 with workers_lock:
 
@@ -611,14 +716,16 @@ def handle_worker(connection, address):
                     "status": "success",
                 })
 
-                if all_completed and not completion_announced:
-
-                    completion_announced = True
+                if announce_completion:
 
                     print("\n===================================")
                     print("SELURUH TUGAS BERHASIL DIPROSES")
                     print("===================================")
                     print(f"Total hasil: {len(results)}")
+                    print(
+                        "Ketik 'new' untuk mengulang dataset "
+                        "atau 'close' untuk menutup program."
+                    )
 
             # ----------------------------------
             # HEARTBEAT
@@ -650,8 +757,8 @@ def handle_worker(connection, address):
             with workers_lock:
                 connected_workers.pop(worker_id, None)
                 worker_count = len(connected_workers)
-                if worker_count < MIN_WORKERS and not processing_started:
-                    target_reached_announced = False
+                if worker_count < MIN_WORKERS and job_state == "ready":
+                    job_state = "waiting_workers"
 
             if returned:
                 print(
@@ -676,13 +783,11 @@ def start_master(worker_target=None):
     global total_tasks
     global completed_count
     global completion_announced
-    global processing_started
-    global target_reached_announced
+    global job_state
 
     completed_count = 0
     completion_announced = False
-    processing_started = False
-    target_reached_announced = False
+    job_state = "waiting_workers"
 
     results.clear()
     completed_task_ids.clear()
@@ -730,6 +835,7 @@ def start_master(worker_target=None):
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((MASTER_HOST, MASTER_PORT))
     server.listen(10)
+    server.settimeout(1.0)
 
     print(f"Master berjalan pada port {MASTER_PORT}")
     print(
@@ -746,7 +852,25 @@ def start_master(worker_target=None):
 
         while True:
 
-            connection, address = server.accept()
+            with workers_lock:
+                shutting_down = job_state == "shutting_down"
+                no_connected_workers = not connected_workers
+
+            if shutting_down and no_connected_workers:
+                break
+
+            try:
+                connection, address = server.accept()
+            except socket.timeout:
+                continue
+
+            with workers_lock:
+                shutting_down = job_state == "shutting_down"
+
+            if shutting_down:
+                send_message(connection, {"type": "shutdown"})
+                connection.close()
+                continue
 
             thread = threading.Thread(
                 target=handle_worker,

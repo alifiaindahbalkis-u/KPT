@@ -53,6 +53,7 @@ def start_worker():
     last_batch_count = 0
     worker_wait_announced = False
     start_wait_announced = False
+    job_complete_announced = False
 
     try:
 
@@ -162,15 +163,38 @@ def start_worker():
                     time.sleep(1)
                     continue
 
+                elif message_type == "job_complete":
+
+                    if not job_complete_announced:
+                        print(
+                            "\n[JOB COMPLETE] Tugas saat ini selesai. "
+                            "Tetap terhubung menunggu keputusan Master."
+                        )
+                        job_complete_announced = True
+
+                    start_wait_announced = False
+                    time.sleep(1)
+                    continue
+
+                elif message_type == "shutdown":
+                    print("\nMaster menutup sesi. Worker berhenti.")
+                    break
+
                 # ----------------------------------
                 # TIDAK ADA TUGAS TERSISA
                 # ----------------------------------
 
                 elif message_type == "no_task":
 
-                    print("\nTidak ada tugas tersisa.")
-                    print("Worker selesai bekerja.")
-                    break
+                    if not job_complete_announced:
+                        print(
+                            "\n[JOB COMPLETE] Belum ada tugas tersisa. "
+                            "Tetap terhubung menunggu keputusan Master."
+                        )
+                        job_complete_announced = True
+
+                    time.sleep(1)
+                    continue
 
                 # ----------------------------------
                 # MENERIMA BATCH TUGAS
@@ -182,6 +206,10 @@ def start_worker():
 
                     if not tasks:
                         continue
+
+                    job_complete_announced = False
+                    worker_wait_announced = False
+                    start_wait_announced = False
 
                     print(
                         f"\n[BATCH] {WORKER_ID} menerima "
