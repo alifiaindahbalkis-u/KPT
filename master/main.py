@@ -323,10 +323,14 @@ def master_console():
                 if job_state == "completed":
                     job_state = "shutting_down"
                     message = "Master ditutup; Worker akan diberi tahu."
+                    should_exit = True
                 else:
                     message = "Pilih 'close' setelah job selesai."
+                    should_exit = False
 
             print(message)
+            if should_exit:
+                return
 
         else:
             print(
@@ -832,7 +836,14 @@ def start_master(worker_target=None):
     print(f"\nTarget Worker dipilih: {MIN_WORKERS}")
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        server.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_EXCLUSIVEADDRUSE,
+            1,
+        )
+    else:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((MASTER_HOST, MASTER_PORT))
     server.listen(10)
     server.settimeout(1.0)
