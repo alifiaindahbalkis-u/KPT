@@ -51,6 +51,7 @@ def start_worker():
     # Informasi performa batch sebelumnya.
     last_batch_duration = 0
     last_batch_count = 0
+    approval_wait_announced = False
 
     try:
 
@@ -135,6 +136,18 @@ def start_worker():
                     print(
                         "\n[WAIT] Menunggu tugas tersedia..."
                     )
+
+                    time.sleep(1)
+                    continue
+
+                elif message_type == "wait_approval":
+
+                    if not approval_wait_announced:
+                        print(
+                            "\n[APPROVAL] Menunggu persetujuan "
+                            "Master sebelum mulai bekerja."
+                        )
+                        approval_wait_announced = True
 
                     time.sleep(1)
                     continue

@@ -244,6 +244,72 @@ def requeue_worker_tasks(worker_id):
 
 
 # ==========================================
+# MASTER CONSOLE
+# ==========================================
+
+def master_console():
+    print(
+        "Perintah master: list | approve <worker_id> | approve all"
+    )
+
+    while True:
+        try:
+            command = input("MASTER> ").strip().split()
+        except EOFError:
+            return
+
+        if not command:
+            continue
+
+        action = command[0].lower()
+
+        if action == "list" and len(command) == 1:
+            with workers_lock:
+                workers = [
+                    (
+                        worker_id,
+                        worker["address"],
+                        worker["approved"],
+                    )
+                    for worker_id, worker in connected_workers.items()
+                ]
+
+            if not workers:
+                print("Belum ada Worker yang terhubung.")
+                continue
+
+            for worker_id, address, approved in workers:
+                status = "DISETUJUI" if approved else "MENUNGGU PERSETUJUAN"
+                print(f"{worker_id} ({address}) - {status}")
+
+        elif action == "approve" and len(command) == 2:
+            target = command[1]
+
+            with workers_lock:
+                if target.lower() == "all":
+                    approved_workers = list(connected_workers)
+                    for worker in connected_workers.values():
+                        worker["approved"] = True
+                else:
+                    worker = connected_workers.get(target)
+                    approved_workers = [target] if worker else []
+                    if worker:
+                        worker["approved"] = True
+
+            if approved_workers:
+                for worker_id in approved_workers:
+                    print(f"Worker {worker_id} disetujui.")
+            else:
+                print(f"Worker '{target}' tidak ditemukan.")
+
+        else:
+            print(
+                "Perintah tidak dikenal. Gunakan: "
+                "list | approve <worker_id> | approve all"
+            )
+
+
+# ==========================================
 # HANDLE WORKER
 # ==========================================
 
@@ -280,12 +346,17 @@ def handle_worker(connection, address):
                 "memory_percent": None,
                 "throughput": 0,
                 "assigned_tasks": set(),
+                "approved": False,
             }
 
             worker_count = len(connected_workers)
 
         print(f"Worker terdaftar: {worker_id}")
         print(f"Worker aktif: {worker_count}/{MIN_WORKERS}")
+        print(
+            f"[APPROVAL PENDING] Gunakan 'approve {worker_id}' "
+            "di konsol master untuk mengizinkan tugas."
+        )
 
         send_message(connection, {
             "type": "registered",
@@ -319,6 +390,17 @@ def handle_worker(connection, address):
                         "message": "Menunggu Worker lainnya",
                     })
 
+                    continue
+
+                with workers_lock:
+                    worker = connected_workers.get(worker_id)
+                    approved = bool(worker and worker["approved"])
+
+                if not approved:
+                    send_message(connection, {
+                        "type": "wait_approval",
+                        "message": "Menunggu persetujuan Master",
+                    })
                     continue
 
                 batch_size = calculate_batch_size(worker_id)
@@ -563,6 +645,10 @@ def start_master():
     print(f"Master berjalan pada port {MASTER_PORT}")
     print(f"Total tugas: {total_tasks}")
     print(f"Menunggu minimal {MIN_WORKERS} Worker...\n")
+    threading.Thread(
+        target=master_console,
+        daemon=True,
+    ).start()
 
     try:
 
